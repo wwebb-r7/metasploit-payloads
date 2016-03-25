@@ -8,7 +8,24 @@ extern PLIST gExtensionList;
 // see common/base.c
 extern Command *extensionCommands;
 
-DWORD initialise_extension(HMODULE hLibrary, BOOL bLibLoadedReflectivly, Remote* pRemote, Packet* pResponse, Command* pFirstCommand)
+DWORD stagelessinit_extension(const char* extensionName, LPBYTE data, DWORD dataSize)
+{
+	dprintf("[STAGELESSINIT] searching for extension init for %s in %p", extensionName, gExtensionList);
+	dprintf("[STAGELESSINIT] extension list start is %p", gExtensionList->start);
+	for (PNODE node = gExtensionList->start; node != NULL; node = node->next)
+	{
+		PEXTENSION ext = (PEXTENSION)node->data;
+		dprintf("[STAGELESSINIT] comparing to %s (init is %p)", ext->name, ext->stagelessInit);
+		if (strcmp(ext->name, extensionName) == 0 && ext->stagelessInit != NULL)
+		{
+			dprintf("[STAGELESSINIT] found for %s", extensionName);
+			return ext->stagelessInit(data, dataSize);
+		}
+	}
+	return ERROR_NOT_FOUND;
+}
+
+DWORD load_extension(HMODULE hLibrary, BOOL bLibLoadedReflectivly, Remote* pRemote, Packet* pResponse, Command* pFirstCommand)
 {
 	DWORD dwResult = ERROR_OUTOFMEMORY;
 	PEXTENSION pExtension = (PEXTENSION)malloc(sizeof(EXTENSION));
@@ -26,12 +43,16 @@ DWORD initialise_extension(HMODULE hLibrary, BOOL bLibLoadedReflectivly, Remote*
 			pExtension->init = (PSRVINIT)GetProcAddressR(pExtension->library, "InitServerExtension");
 			pExtension->deinit = (PSRVDEINIT)GetProcAddressR(pExtension->library, "DeinitServerExtension");
 			pExtension->getname = (PSRVGETNAME)GetProcAddressR(pExtension->library, "GetExtensionName");
+			pExtension->commandAdded = (PCMDADDED)GetProcAddressR(pExtension->library, "CommandAdded");
+			pExtension->stagelessInit = (PSTAGELESSINIT)GetProcAddressR(pExtension->library, "StagelessInit");
 		}
 		else
 		{
 			pExtension->init = (PSRVINIT)GetProcAddress(pExtension->library, "InitServerExtension");
 			pExtension->deinit = (PSRVDEINIT)GetProcAddress(pExtension->library, "DeinitServerExtension");
 			pExtension->getname = (PSRVGETNAME)GetProcAddress(pExtension->library, "GetExtensionName");
+			pExtension->commandAdded = (PCMDADDED)GetProcAddress(pExtension->library, "CommandAdded");
+			pExtension->stagelessInit = (PSTAGELESSINIT)GetProcAddress(pExtension->library, "StagelessInit");
 		}
 
 		// patch in the metsrv.dll's HMODULE handle, used by the server extensions for delay loading
@@ -55,6 +76,15 @@ DWORD initialise_extension(HMODULE hLibrary, BOOL bLibLoadedReflectivly, Remote*
 
 			if (dwResult == ERROR_SUCCESS)
 			{
+				// inform the new extension of the existing commands
+				if (pExtension->commandAdded)
+				{
+					for (Command* command = pExtension->end; command != NULL; command = command->next)
+					{
+						pExtension->commandAdded(command->method);
+					}
+				}
+
 				if (pExtension->getname)
 				{
 					pExtension->getname(pExtension->name, sizeof(pExtension->name));
@@ -74,6 +104,17 @@ DWORD initialise_extension(HMODULE hLibrary, BOOL bLibLoadedReflectivly, Remote*
 			for (Command* command = pExtension->start; command != pExtension->end; command = command->next)
 			{
 				packet_add_tlv_string(pResponse, TLV_TYPE_METHOD, command->method);
+
+				// inform existing extensions of the new commands
+				for (PNODE node = gExtensionList->start; node != NULL; node = node->next)
+				{
+					PEXTENSION ext = (PEXTENSION)node->data;
+					// don't inform the extension of itself
+					if (ext != pExtension && ext->commandAdded)
+					{
+						ext->commandAdded(command->method);
+					}
+				}
 			}
 		}
 	}
@@ -185,15 +226,14 @@ DWORD request_core_loadlib(Remote *pRemote, Packet *pPacket)
 		// call its Init routine
 		if ((flags & LOAD_LIBRARY_FLAG_EXTENSION) && library)
 		{
-			res = initialise_extension(library, bLibLoadedReflectivly, pRemote, response, first);
+			res = load_extension(library, bLibLoadedReflectivly, pRemote, response, first);
 		}
 
 	} while (0);
 
 	if (response)
 	{
-		packet_add_tlv_uint(response, TLV_TYPE_RESULT, res);
-		PACKET_TRANSMIT(pRemote, response, NULL);
+		packet_transmit_response(res, pRemote, response);
 	}
 
 	return res;
@@ -217,7 +257,9 @@ DWORD request_core_uuid(Remote* remote, Packet* packet)
 DWORD request_core_machine_id(Remote* pRemote, Packet* pPacket)
 {
 	DWORD res = ERROR_SUCCESS;
+	dprintf("[CORE] Running request_core_machine_id");
 	Packet* pResponse = packet_create_response(pPacket);
+	dprintf("[CORE] pResponse is %p", pResponse);
 
 	if (pResponse)
 	{
@@ -236,6 +278,7 @@ DWORD request_core_machine_id(Remote* pRemote, Packet* pPacket)
 
 			_snwprintf_s(buffer, MAX_PATH, MAX_PATH - 1, L"%04x-%04x:%s", HIWORD(serialNumber), LOWORD(serialNumber), computerName);
 			packet_add_tlv_wstring(pResponse, TLV_TYPE_MACHINE_ID, buffer);
+			dprintf("[CORE] sending machine id: %S", buffer);
 		}
 
 		packet_transmit_response(res, pRemote, pResponse);

