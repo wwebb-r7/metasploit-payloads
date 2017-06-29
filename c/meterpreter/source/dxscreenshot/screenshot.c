@@ -26,23 +26,19 @@ DWORD screenshot( int quality, DWORD dwPipeName )
 
 	_snprintf_s(cNamedPipe, sizeof(cNamedPipe), MAX_PATH, "\\\\.\\pipe\\%08X", dwPipeName);
 
-	/* add code here */
-
 	// create object
 	void* msfss = MsfScreenShot_create();
-	
-	// get raw desktop bitmap
+
+  // get raw desktop bitmap
 	MsfScreenShot_InitRawDesktop(msfss);
-	
+
 	// encode to specified format (hardcoded as jpg for testing)
 	BYTE *img = NULL;
 	DWORD size = 0;
 	MsfScreenShot_EncodeData(msfss, &img, &size, GUID_ContainerFormatJpeg);
-	
+
 	// delete object
 	MsfScreenShot_delete(msfss);
-	
-	/* end initial additions */
 
 	// if we have successfully taken a screenshot we send it back via the named pipe
 	// but if we have failed we send back a zero byte result to indicate this failure.
